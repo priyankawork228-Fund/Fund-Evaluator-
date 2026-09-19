@@ -3,45 +3,74 @@ import pandas as pd
 import numpy as np
 import google.genai as genai
 import json
+import requests
+import io
 
 st.set_page_config(page_title="Universal Portfolio & Exit Engine", layout="wide")
 st.title("📊 Universal Portfolio Evaluator & Exit Strategy Engine")
 
 st.markdown("""
-Upload ANY portfolio file. The engine analyzes standard universal ratios, detects red flags, 
-and automatically builds a **tailored Exit Strategy & Replacement Recommendation** with clear reasons.
+Analyze portfolio performance by **uploading a file** or **entering a direct URL** (Excel, CSV, TSV, Google Sheets CSV export).
 """)
 
-uploaded_file = st.file_uploader(
-    "Upload Portfolio File (Excel, CSV, TXT, TSV, PDF)", 
-    type=["xlsx", "xls", "csv", "txt", "tsv", "pdf"]
-)
+# Input Option Selection
+input_method = st.radio("Choose Input Method:", ["Upload File", "Paste Data URL"], horizontal=True)
+
+uploaded_file = None
+data_url = None
+
+if input_method == "Upload File":
+    uploaded_file = st.file_uploader(
+        "Upload Portfolio File (Excel, CSV, TXT, TSV, PDF)", 
+        type=["xlsx", "xls", "csv", "txt", "tsv", "pdf"]
+    )
+else:
+    data_url = st.text_input(
+        "Enter Direct Data URL (e.g., direct CSV link, raw GitHub file, or published Google Sheet CSV link)"
+    )
 
 api_key = st.text_input("Enter Google Gemini API Key", type="password")
 
-# 1. Multi-Format Universal Reader
-def load_data_universal(file):
-    filename = file.name.lower()
-    if filename.endswith(('.xlsx', '.xls')):
-        xls = pd.ExcelFile(file)
-        return {sheet: pd.read_excel(file, sheet_name=sheet) for sheet in xls.sheet_names}
-    elif filename.endswith(('.csv', '.tsv', '.txt')):
-        try:
-            return {"Sheet1": pd.read_csv(file, sep=None, engine='python')}
-        except Exception:
-            file.seek(0)
-            return {"Sheet1": pd.read_csv(file, sep='\t', engine='python')}
-    elif filename.endswith('.pdf'):
-        import pdfplumber
-        text_lines = []
-        with pdfplumber.open(file) as pdf:
-            for page in pdf.pages:
-                if page.extract_text():
-                    text_lines.extend(page.extract_text().split("\n"))
-        return {"Sheet1": pd.DataFrame({"PDF_Text": text_lines})}
+# 1. Multi-Source Universal Reader (File & URL)
+def load_data_universal(source, is_url=False):
+    sheets_dict = {}
+    
+    if is_url:
+        response = requests.get(source)
+        response.raise_for_status()
+        
+        # Determine format from URL structure or content type
+        url_lower = source.lower()
+        if url_lower.endswith(('.xlsx', '.xls')) or 'spreadsheet' in response.headers.get('Content-Type', ''):
+            xls = pd.ExcelFile(io.BytesIO(response.content))
+            return {sheet: pd.read_excel(xls, sheet_name=sheet) for sheet in xls.sheet_names}
+        else:
+            # Default fallback to CSV/text parsing
+            return {"Sheet1": pd.read_csv(io.StringIO(response.text))}
+            
+    else:
+        filename = source.name.lower()
+        if filename.endswith(('.xlsx', '.xls')):
+            xls = pd.ExcelFile(source)
+            return {sheet: pd.read_excel(source, sheet_name=sheet) for sheet in xls.sheet_names}
+        elif filename.endswith(('.csv', '.tsv', '.txt')):
+            try:
+                return {"Sheet1": pd.read_csv(source, sep=None, engine='python')}
+            except Exception:
+                source.seek(0)
+                return {"Sheet1": pd.read_csv(source, sep='\t', engine='python')}
+        elif filename.endswith('.pdf'):
+            import pdfplumber
+            text_lines = []
+            with pdfplumber.open(source) as pdf:
+                for page in pdf.pages:
+                    if page.extract_text():
+                        text_lines.extend(page.extract_text().split("\n"))
+            return {"Sheet1": pd.DataFrame({"PDF_Text": text_lines})}
+            
     return {}
 
-# 2. Universal Metric & Signal Engine
+# 2. Universal Metric Extraction Engine
 def process_universal_metrics(sheets_dict):
     metrics = {
         "sharpe_ratio": 0.43,
@@ -51,9 +80,7 @@ def process_universal_metrics(sheets_dict):
         "max_negative_streak": 2
     }
     
-    # Extract values directly if present in sheets
     for sheet_name, df in sheets_dict.items():
-        df_str = df.astype(str)
         for idx, row in df.iterrows():
             row_str = " ".join([str(v) for v in row.values]).lower()
             if "sharpe" in row_str:
@@ -66,14 +93,22 @@ def process_universal_metrics(sheets_dict):
     return metrics
 
 
-if uploaded_file and api_key:
+# Trigger Condition
+ready_to_analyze = (uploaded_file is not None or bool(data_url)) and bool(api_key)
+
+if ready_to_analyze:
     if st.button("🚀 Analyze Portfolio & Generate Exit Strategy"):
         try:
-            sheets_dict = load_data_universal(uploaded_file)
+            # Load Data
+            if uploaded_file:
+                sheets_dict = load_data_universal(uploaded_file, is_url=False)
+            else:
+                sheets_dict = load_data_universal(data_url, is_url=True)
+                
             metrics = process_universal_metrics(sheets_dict)
             
-            # Step 1: Metric Overview
-            st.success("Portfolio analysis completed successfully!")
+            # Metric Overview
+            st.success("Portfolio data successfully fetched and processed!")
             
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("3Yr Alpha", f"{metrics['alpha']}%")
@@ -81,7 +116,7 @@ if uploaded_file and api_key:
             c3.metric("Downside Capture", f"{metrics['downside_capture']}%")
             c4.metric("Negative Streak", f"{metrics['max_negative_streak']} Years")
 
-            # Step 2: Red Flag Evaluation
+            # Red Flag Evaluation
             category_benchmarks = {"sharpe_avg": 0.55, "downside_max": 85.0}
             red_flags = []
             
@@ -96,7 +131,7 @@ if uploaded_file and api_key:
 
             needs_exit = len(red_flags) >= 2
 
-            # Step 3: Exit Strategy & Replacement Prompt Construction
+            # Prompt Construction
             llm_prompt = f"""
 You are a senior Wealth Manager and Portfolio Advisor.
 
@@ -115,26 +150,24 @@ PART 1: ANALYSIS & DIAGNOSIS
 Explain clearly why the fund is underperforming based on the identified red flags and universal metrics.
 
 PART 2: EXIT STRATEGY & JUSTIFICATION (WITH REASONS)
-Detail the step-by-step Exit Strategy. State the exact reasons why staying in this fund poses an opportunity cost (e.g., poor downside protection, lack of alpha recovery).
+Detail the step-by-step Exit Strategy. State the exact reasons why staying in this fund poses an opportunity cost.
 
 PART 3: NEXT SUITABLE FUND RECOMMENDATION
-Recommend the ideal characteristics and peer parameters for the replacement fund. 
-Specify target metrics for the new fund (e.g., Sharpe > 0.55, Downside Capture < 80%, Positive 3Yr Alpha) and suggest top-tier category peers that fit this criteria.
+Recommend the ideal target characteristics for the replacement fund (e.g., Sharpe > 0.55, Downside Capture < 80%) and suggest top-tier category peers.
 
 NOTE: Do NOT perform any mathematical calculations. Use the exact figures provided above.
 """
 
-            # Step 4: Run LLM Generation
+            # Run LLM
             client = genai.Client(api_key=api_key)
             try:
                 response = client.models.generate_content(model="gemini-3.6-flash", contents=llm_prompt)
             except Exception:
                 response = client.models.generate_content(model="gemini-2.5-flash-lite", contents=llm_prompt)
 
-            # Display Output
             st.markdown("---")
             st.subheader("📌 Executive Portfolio & Exit Strategy Report")
             st.write(response.text)
 
         except Exception as e:
-            st.error(f"Error processing strategy: {str(e)}")
+            st.error(f"Error reading URL or processing data: {str(e)}")
